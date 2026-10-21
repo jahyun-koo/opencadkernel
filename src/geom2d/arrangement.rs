@@ -93,6 +93,119 @@ pub fn bounded_faces(segments: &[Line], tolerance: Tolerance) -> Vec<Vec<[f64; 2
     graph.trace_faces()
 }
 
+/// A computation given up because its caller stopped asking for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stopped;
+
+/// How often the sweeps ask whether to go on, in segments.
+const CHECK_EVERY: usize = 64;
+
+/// [`bounded_faces`] that gives up with [`Stopped`] once `active` turns
+/// false; the same faces when it does not.
+fn bounded_faces_while(
+    segments: &[Line],
+    tolerance: f64,
+    active: &dyn Fn() -> bool,
+) -> Result<Vec<Vec<[f64; 2]>>, Stopped> {
+    if segments.is_empty() {
+        return Ok(Vec::new());
+    }
+    let bounds: Vec<Bounds> = segments.iter().copied().map(Bounds::of).collect();
+    let sweep = Sweep::new(&bounds, tolerance);
+    let cuts = match sweep.bucketed_cuts_while(segments, &bounds, active)? {
+        Some(cuts) => cuts,
+        None => sweep.cuts_while(segments, &bounds, active)?,
+    };
+    faces_at_cuts(segments, cuts, tolerance, active)
+}
+
+/// The faces the cut segments bound, asking `active` between the steps.
+fn faces_at_cuts(
+    segments: &[Line],
+    cuts: Vec<Vec<f64>>,
+    tolerance: f64,
+    active: &dyn Fn() -> bool,
+) -> Result<Vec<Vec<[f64; 2]>>, Stopped> {
+    let pieces = pieces_at_cuts(segments, cuts, tolerance);
+    if !active() {
+        return Err(Stopped);
+    }
+    let graph = Graph::weld(&pieces, tolerance);
+    if !active() {
+        return Err(Stopped);
+    }
+    Ok(graph.trace_faces())
+}
+
+/// [`bounded_faces`] of `segments`, and of `segments` and `extra` together,
+/// splitting `segments` against each other only once: what the two
+/// readings share is worked out once, then only the pairs `extra` makes are
+/// added. The same faces, in the same order, as two calls would give.
+pub fn bounded_faces_with_extra(
+    segments: &[Line],
+    extra: &[Line],
+    tolerance: Tolerance,
+) -> (Vec<Vec<[f64; 2]>>, Vec<Vec<[f64; 2]>>) {
+    bounded_faces_with_extra_while(segments, extra, tolerance, &|| true)
+        .expect("a computation that is never stopped finishes")
+}
+
+/// [`bounded_faces_with_extra`] that gives up with [`Stopped`] once
+/// `active` turns false; the same faces when it does not.
+pub fn bounded_faces_with_extra_while(
+    segments: &[Line],
+    extra: &[Line],
+    tolerance: Tolerance,
+    active: &dyn Fn() -> bool,
+) -> Result<(Vec<Vec<[f64; 2]>>, Vec<Vec<[f64; 2]>>), Stopped> {
+    let tolerance = tolerance.linear();
+    if segments.is_empty() {
+        return Ok((Vec::new(), bounded_faces_while(extra, tolerance, active)?));
+    }
+    let bounds: Vec<Bounds> = segments.iter().copied().map(Bounds::of).collect();
+    let sweep = Sweep::new(&bounds, tolerance);
+    let cuts = match sweep.bucketed_cuts_while(segments, &bounds, active)? {
+        Some(cuts) => cuts,
+        None => sweep.cuts_while(segments, &bounds, active)?,
+    };
+    let alone = faces_at_cuts(segments, cuts.clone(), tolerance, active)?;
+    if extra.is_empty() {
+        return Ok((alone.clone(), alone));
+    }
+    let all: Vec<Line> = segments.iter().chain(extra).copied().collect();
+    let all_bounds: Vec<Bounds> = all.iter().copied().map(Bounds::of).collect();
+    let together = Sweep::new(&all_bounds, tolerance);
+    if together.vertical != sweep.vertical {
+        // Swept the other way, pairs meet in the other order.
+        return Ok((alone, bounded_faces_while(&all, tolerance, active)?));
+    }
+    // The stable sort keeps `segments` in their own order, so each pair of
+    // them is met as before; only pairs with an extra line are new.
+    let mut rank = vec![0; all.len()];
+    for (at, &i) in together.order.iter().enumerate() {
+        rank[i] = at;
+    }
+    let mut cuts = cuts;
+    cuts.resize(all.len(), vec![0.0, 1.0]);
+    let n = segments.len();
+    for e in n..all.len() {
+        if (e - n).is_multiple_of(CHECK_EVERY) && !active() {
+            return Err(Stopped);
+        }
+        for s in 0..all.len() {
+            // Extra pairs once, from the earlier one.
+            if s == e || (n..e).contains(&s) || !all_bounds[e].overlaps(all_bounds[s], tolerance)
+            {
+                continue;
+            }
+            let (index, other) = if rank[e] > rank[s] { (e, s) } else { (s, e) };
+            together.cross(&all, &mut cuts, index, other);
+        }
+    }
+    let both = faces_at_cuts(&all, cuts, tolerance, active)?;
+    Ok((alone, both))
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct TaggedLine {
     pub line: Line,
@@ -219,37 +332,195 @@ impl Bounds {
 /// to end.
 fn split_at_crossings(segments: &[Line], tolerance: f64) -> Vec<Line> {
     let bounds: Vec<Bounds> = segments.iter().copied().map(Bounds::of).collect();
-    let vertical = sweep_on_y(&bounds, tolerance);
-    let key = |b: &Bounds| if vertical { b.min.y } else { b.min.x };
-    let far = |b: &Bounds| if vertical { b.max.y } else { b.max.x };
+    let sweep = Sweep::new(&bounds, tolerance);
+    let cuts = sweep
+        .bucketed_cuts(segments, &bounds)
+        .unwrap_or_else(|| sweep.cuts(segments, &bounds));
+    pieces_at_cuts(segments, cuts, tolerance)
+}
 
-    let mut order: Vec<usize> = (0..segments.len()).collect();
-    order.sort_by(|&a, &b| key(&bounds[a]).total_cmp(&key(&bounds[b])));
+/// The order segments are swept in: along the less congested axis, by
+/// where each starts on it.
+struct Sweep {
+    vertical: bool,
+    order: Vec<usize>,
+    tolerance: f64,
+}
 
-    let mut cuts: Vec<Vec<f64>> = vec![vec![0.0, 1.0]; segments.len()];
-    let mut active: Vec<usize> = Vec::new();
-    for index in order {
-        let front = key(&bounds[index]);
-        active.retain(|&other| far(&bounds[other]) + tolerance >= front);
-        for &other in &active {
-            if !bounds[index].overlaps(bounds[other], tolerance) {
-                continue;
-            }
-            match segment_crossing(segments[index], segments[other], Tolerance::new(tolerance)) {
-                SegmentCrossing::None => {}
-                SegmentCrossing::Point { a, b } => {
-                    cuts[index].push(a.clamp(0.0, 1.0));
-                    cuts[other].push(b.clamp(0.0, 1.0));
-                }
-                SegmentCrossing::Overlap { a, b } => {
-                    cuts[index].extend(a.iter().map(|t| t.clamp(0.0, 1.0)));
-                    cuts[other].extend(b.iter().map(|t| t.clamp(0.0, 1.0)));
-                }
-            }
-        }
-        active.push(index);
+impl Sweep {
+    fn new(bounds: &[Bounds], tolerance: f64) -> Self {
+        let vertical = sweep_on_y(bounds, tolerance);
+        let mut order: Vec<usize> = (0..bounds.len()).collect();
+        let sweep = Self {
+            vertical,
+            order: Vec::new(),
+            tolerance,
+        };
+        order.sort_by(|&a, &b| sweep.key(&bounds[a]).total_cmp(&sweep.key(&bounds[b])));
+        Self { order, ..sweep }
     }
 
+    fn key(&self, b: &Bounds) -> f64 {
+        if self.vertical {
+            b.min.y
+        } else {
+            b.min.x
+        }
+    }
+
+    fn far(&self, b: &Bounds) -> f64 {
+        if self.vertical {
+            b.max.y
+        } else {
+            b.max.x
+        }
+    }
+
+    /// The extent across the sweep.
+    fn across(&self, b: &Bounds) -> (f64, f64) {
+        if self.vertical {
+            (b.min.x, b.max.x)
+        } else {
+            (b.min.y, b.max.y)
+        }
+    }
+
+    /// Records where `index` and `other` (swept earlier) cross on each.
+    fn cross(&self, segments: &[Line], cuts: &mut [Vec<f64>], index: usize, other: usize) {
+        match segment_crossing(segments[index], segments[other], Tolerance::new(self.tolerance)) {
+            SegmentCrossing::None => {}
+            SegmentCrossing::Point { a, b } => {
+                cuts[index].push(a.clamp(0.0, 1.0));
+                cuts[other].push(b.clamp(0.0, 1.0));
+            }
+            SegmentCrossing::Overlap { a, b } => {
+                cuts[index].extend(a.iter().map(|t| t.clamp(0.0, 1.0)));
+                cuts[other].extend(b.iter().map(|t| t.clamp(0.0, 1.0)));
+            }
+        }
+    }
+
+    /// The cut parameters along every segment: each pair whose boxes meet
+    /// (within the tolerance) is tried once, the later-swept first.
+    fn cuts(&self, segments: &[Line], bounds: &[Bounds]) -> Vec<Vec<f64>> {
+        self.cuts_while(segments, bounds, &|| true)
+            .expect("a sweep that is never stopped finishes")
+    }
+
+    /// [`Self::cuts`], giving up with [`Stopped`] once `go_on` turns false.
+    fn cuts_while(
+        &self,
+        segments: &[Line],
+        bounds: &[Bounds],
+        go_on: &dyn Fn() -> bool,
+    ) -> Result<Vec<Vec<f64>>, Stopped> {
+        let tolerance = self.tolerance;
+        let mut cuts: Vec<Vec<f64>> = vec![vec![0.0, 1.0]; segments.len()];
+        let mut active: Vec<usize> = Vec::new();
+        for (step, &index) in self.order.iter().enumerate() {
+            if step.is_multiple_of(CHECK_EVERY) && !go_on() {
+                return Err(Stopped);
+            }
+            let front = self.key(&bounds[index]);
+            active.retain(|&other| self.far(&bounds[other]) + tolerance >= front);
+            for &other in &active {
+                if !bounds[index].overlaps(bounds[other], tolerance) {
+                    continue;
+                }
+                self.cross(segments, &mut cuts, index, other);
+            }
+            active.push(index);
+        }
+        Ok(cuts)
+    }
+
+    /// [`Self::cuts`] with the active list kept in bands across the sweep,
+    /// so a segment is tried only against those in the bands it spans. A
+    /// pair is tried in the one band holding the larger of their two
+    /// starts across the sweep, which both span when their boxes meet; the
+    /// cuts come out the same, only pushed in another order, which sorting
+    /// them undoes. `None` when the bands would not pay (an extent that is
+    /// not finite, or segments spanning most bands).
+    fn bucketed_cuts(&self, segments: &[Line], bounds: &[Bounds]) -> Option<Vec<Vec<f64>>> {
+        self.bucketed_cuts_while(segments, bounds, &|| true)
+            .expect("a sweep that is never stopped finishes")
+    }
+
+    /// [`Self::bucketed_cuts`], giving up with [`Stopped`] once `go_on`
+    /// turns false.
+    fn bucketed_cuts_while(
+        &self,
+        segments: &[Line],
+        bounds: &[Bounds],
+        go_on: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<Vec<f64>>>, Stopped> {
+        let tolerance = self.tolerance;
+        let n = segments.len();
+        if n < 64 {
+            return Ok(None);
+        }
+        let (low, high) = bounds.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), b| {
+            let (min, max) = self.across(b);
+            (l.min(min - tolerance), h.max(max + tolerance))
+        });
+        if !(low.is_finite() && high.is_finite() && high > low)
+            || bounds.iter().any(|b| {
+                let (min, max) = self.across(b);
+                min.is_nan() || max.is_nan()
+            })
+        {
+            return Ok(None);
+        }
+        let count = ((n as f64).sqrt() as usize).clamp(1, 4096);
+        let width = (high - low) / count as f64;
+        if !(width > 0.0 && width.is_finite()) {
+            return Ok(None);
+        }
+        // Monotone in `v`, which is all the band rule needs.
+        let band = |v: f64| (((v - low) / width).floor().max(0.0) as usize).min(count - 1);
+        let span = |b: &Bounds| {
+            let (min, max) = self.across(b);
+            (band(min - tolerance), band(max + tolerance))
+        };
+        let entries: usize = bounds
+            .iter()
+            .map(|b| {
+                let (from, to) = span(b);
+                to - from + 1
+            })
+            .sum();
+        if entries > 8 * n + 1024 {
+            return Ok(None);
+        }
+        let mut cuts: Vec<Vec<f64>> = vec![vec![0.0, 1.0]; n];
+        let mut bands: Vec<Vec<usize>> = vec![Vec::new(); count];
+        for (step, &index) in self.order.iter().enumerate() {
+            if step.is_multiple_of(CHECK_EVERY) && !go_on() {
+                return Err(Stopped);
+            }
+            let front = self.key(&bounds[index]);
+            let (from, to) = span(&bounds[index]);
+            let start = self.across(&bounds[index]).0;
+            for (at, list) in bands.iter_mut().enumerate().take(to + 1).skip(from) {
+                list.retain(|&other| self.far(&bounds[other]) + tolerance >= front);
+                for &other in list.iter() {
+                    if !bounds[index].overlaps(bounds[other], tolerance) {
+                        continue;
+                    }
+                    if band(start.max(self.across(&bounds[other]).0)) != at {
+                        continue;
+                    }
+                    self.cross(segments, &mut cuts, index, other);
+                }
+                list.push(index);
+            }
+        }
+        Ok(Some(cuts))
+    }
+}
+
+/// The pieces of every segment between its sorted, merged cuts.
+fn pieces_at_cuts(segments: &[Line], mut cuts: Vec<Vec<f64>>, tolerance: f64) -> Vec<Line> {
     let mut pieces = Vec::new();
     for (segment, params) in segments.iter().copied().zip(cuts.iter_mut()) {
         let (start, end) = (Vec2::from(segment.start), Vec2::from(segment.end));
@@ -403,6 +674,10 @@ impl Graph {
         // around a point rather than every vertex placed so far.
         let mut buckets: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
         let mut edges: HashSet<(usize, usize)> = HashSet::new();
+        // In the order first met: neighbours that tie on angle (a spur
+        // folded back on an edge) then keep one order, run to run, where
+        // the set's own order would vary between runs.
+        let mut met: Vec<(usize, usize)> = Vec::new();
 
         for piece in pieces {
             let a = weld_point(
@@ -413,12 +688,15 @@ impl Graph {
             );
             let b = weld_point(Vec2::from(piece.end), &mut vertices, &mut buckets, tolerance);
             if a != b {
-                edges.insert(if a < b { (a, b) } else { (b, a) });
+                let edge = if a < b { (a, b) } else { (b, a) };
+                if edges.insert(edge) {
+                    met.push(edge);
+                }
             }
         }
 
         let mut neighbours = vec![Vec::new(); vertices.len()];
-        for &(a, b) in &edges {
+        for &(a, b) in &met {
             neighbours[a].push(b);
             neighbours[b].push(a);
         }
@@ -886,6 +1164,169 @@ mod tests {
         let faces = bounded_faces(&rectangle(10.0, 10.0), Tolerance::new(1e-15));
         assert_eq!(faces.len(), 1);
         assert!((signed_area(&faces[0]) - 100.0).abs() < 1e-9);
+    }
+
+    /// A small deterministic generator, so the cases are the same each run.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    /// Plan-like piles: grid-snapped walls (some long, some collinear and
+    /// overlapping, some duplicated), short ticks, diagonals, tiny pieces
+    /// shorter than the tolerance, and loose off-grid lines.
+    fn pile(rng: &mut Lcg, n: usize) -> Vec<Line> {
+        let mut out = Vec::with_capacity(n);
+        let snap = |v: f64| (v * 4.0).round() / 4.0;
+        while out.len() < n {
+            let kind = rng.next();
+            let (x, y) = (snap(rng.next() * 100.0), snap(rng.next() * 60.0));
+            let len = snap(rng.next() * if rng.next() < 0.1 { 90.0 } else { 12.0 });
+            let line = if kind < 0.35 {
+                line([x, y], [x + len, y])
+            } else if kind < 0.7 {
+                line([x, y], [x, y + len])
+            } else if kind < 0.8 {
+                line([x, y], [x + len, y + len * rng.next()])
+            } else if kind < 0.85 {
+                line([x, y], [x + 1e-7 * rng.next(), y])
+            } else if kind < 0.9 {
+                // A point drawn as a line.
+                line([x, y], [x, y])
+            } else {
+                line(
+                    [x + rng.next(), y + rng.next()],
+                    [x + rng.next() * 20.0, y + rng.next() * 20.0],
+                )
+            };
+            out.push(line);
+            if rng.next() < 0.05 {
+                out.push(line);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn banded_sweep_cuts_exactly_like_the_plain_sweep() {
+        let mut rng = Lcg(7);
+        let mut banded = 0;
+        for case in 0..300 {
+            let n = 64 + case * 7;
+            let mut segments = pile(&mut rng, n);
+            if case % 3 == 1 {
+                // Rotated, at survey coordinates.
+                let (c, s) = (0.6_f64, 0.8_f64);
+                for l in &mut segments {
+                    for p in [&mut l.start, &mut l.end] {
+                        *p = [512_345.678 + c * p[0] - s * p[1], 4_512_345.678 + s * p[0] + c * p[1]];
+                    }
+                }
+            }
+            let tolerance = [1.0e-6, 1.0e-3, 0.3][case % 3];
+            let bounds: Vec<Bounds> = segments.iter().copied().map(Bounds::of).collect();
+            let sweep = Sweep::new(&bounds, tolerance);
+            let plain = pieces_at_cuts(&segments, sweep.cuts(&segments, &bounds), tolerance);
+            let Some(cuts) = sweep.bucketed_cuts(&segments, &bounds) else {
+                continue;
+            };
+            banded += 1;
+            let fast = pieces_at_cuts(&segments, cuts, tolerance);
+            let bits = |pieces: &[Line]| {
+                pieces
+                    .iter()
+                    .map(|l| [l.start[0], l.start[1], l.end[0], l.end[1]].map(f64::to_bits))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(bits(&plain), bits(&fast), "case {case}");
+        }
+        assert!(banded > 250, "{banded}");
+    }
+
+    #[test]
+    fn faces_with_extra_lines_are_those_of_both_piles_together() {
+        let mut rng = Lcg(11);
+        let bits = |faces: &[Vec<[f64; 2]>]| {
+            faces
+                .iter()
+                .map(|f| f.iter().map(|p| p.map(f64::to_bits)).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        };
+        for case in 0..200 {
+            let segments = pile(&mut rng, if case % 10 == 0 { case % 4 } else { 40 + case * 3 });
+            let extra = pile(&mut rng, case % 7);
+            let tolerance = Tolerance::new([1.0e-6, 1.0e-3, 0.3][case % 3]);
+            let all: Vec<Line> = segments.iter().chain(&extra).copied().collect();
+            let (alone, both) = bounded_faces_with_extra(&segments, &extra, tolerance);
+            assert_eq!(bits(&alone), bits(&bounded_faces(&segments, tolerance)), "case {case}");
+            assert_eq!(bits(&both), bits(&bounded_faces(&all, tolerance)), "case {case}");
+        }
+    }
+
+    #[test]
+    fn faces_with_extra_lines_stop_when_asked_and_match_when_not() {
+        let mut rng = Lcg(23);
+        let segments = pile(&mut rng, 400);
+        let extra = pile(&mut rng, 5);
+        let tolerance = Tolerance::new(1.0e-3);
+        assert_eq!(
+            bounded_faces_with_extra_while(&segments, &extra, tolerance, &|| false),
+            Err(Stopped)
+        );
+        // Stopped part way through, at each of the places it asks.
+        let asked = std::cell::Cell::new(0usize);
+        let _ = bounded_faces_with_extra_while(&segments, &extra, tolerance, &|| {
+            asked.set(asked.get() + 1);
+            true
+        });
+        for stop_at in 1..asked.get() {
+            let n = std::cell::Cell::new(0usize);
+            let stopped = bounded_faces_with_extra_while(&segments, &extra, tolerance, &|| {
+                n.set(n.get() + 1);
+                n.get() <= stop_at
+            });
+            assert_eq!(stopped, Err(Stopped), "stop at {stop_at}");
+        }
+        assert_eq!(
+            bounded_faces_with_extra_while(&segments, &extra, tolerance, &|| true),
+            Ok(bounded_faces_with_extra(&segments, &extra, tolerance))
+        );
+    }
+
+    #[test]
+    fn banded_sweep_steps_aside_for_extents_it_cannot_band() {
+        let mut segments = pile(&mut Lcg(3), 100);
+        // A box drops a NaN coordinate; both sweeps then see the same box.
+        segments.push(line([0.0, f64::NAN], [1.0, 2.0]));
+        segments.push(line([f64::NAN, f64::NAN], [f64::NAN, f64::NAN]));
+        let bounds: Vec<Bounds> = segments.iter().copied().map(Bounds::of).collect();
+        let sweep = Sweep::new(&bounds, 1e-6);
+        let plain = sweep.cuts(&segments, &bounds);
+        if let Some(banded) = sweep.bucketed_cuts(&segments, &bounds) {
+            let bits = |c: Vec<Vec<f64>>| {
+                c.into_iter()
+                    .map(|mut v| {
+                        v.sort_by(f64::total_cmp);
+                        v.into_iter().map(f64::to_bits).collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(bits(plain), bits(banded));
+        }
+        segments.truncate(100);
+        segments.push(line([0.0, -1.0e308], [0.0, 1.0e308]));
+        segments.push(line([-1.0e308, 0.0], [1.0e308, 0.0]));
+        let bounds: Vec<Bounds> = segments.iter().copied().map(Bounds::of).collect();
+        assert!(Sweep::new(&bounds, 1e-6).bucketed_cuts(&segments, &bounds).is_none());
+        // Still split the plain way.
+        assert!(!split_at_crossings(&segments, 1e-6).is_empty());
     }
 
     #[test]
